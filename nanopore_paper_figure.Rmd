@@ -1,0 +1,252 @@
+---
+title: "Nanopore paper figure"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+library(tidyverse)
+library(DSS)
+library(edgeR)
+library(ggpubr)
+library(gggenes)
+library(MetBrewer)
+library(cowplot)
+library(tidytable)
+
+# Read gene annotations
+gff <- read_tsv(pipe("grep -v '#' /media/ssd_4tb/felix/projects/crebbp_methylation/promethion_methylation/gencode.v19.annotation.gff3"), col_names = c("chr", "V2", "V3", "start", "V5", "V6", "V7", "V8", "V9"))
+
+# Filter for genes and get gene names 
+gff <- gff %>% 
+  filter(V3 == "gene") %>%
+  dplyr::mutate(name = sub(".*gene_name=(.*?);.*", "\\1", V9))
+
+#######
+# DMR # 
+#######
+file_paths <- list.files("/media/ssd_4tb/felix/projects/crebbp_methylation/promethion_methylation/review_comments/modkit_pileup/", pattern = "*.dds$", full.names = TRUE)
+
+# Read DDS tabular files without headers
+read_tabular_file <- function(file_path) {
+  read.table(file_path, col.names = c("chr", "pos", "N", "X"))
+}
+
+# Read and store tabular files in a list
+file_contents <- lapply(file_paths, read_tabular_file)
+
+# Function to extract digits from filenames (use as sample names)
+extract_digits <- function(string) {
+  digits <- as.numeric(sub(".*op_\\d{3}_(\\d{3}).*", "\\1", string))
+  formatted_digits <- sprintf("%03d", as.numeric(digits))
+  formatted_digits
+}
+
+# Apply the function to each string in the list
+sample_names <- lapply(file_paths, extract_digits)
+
+# Display the extracted digits
+print(sample_names)
+
+# Make DDS object  
+BSobj = makeBSseqData(file_contents, sampleNames = sample_names)
+
+# Smoothing window is 500 bp by default
+make_dmr_plot <- function(arrangement, group_1, group_2, pval_t) {
+  
+  # Proband against all but father
+  dmltest_004_against_all = DMLtest(BSobj, group1= c("004"), group2 = c("001", "003", "005", "006", "007", "008", "009", "010", "011", "012", "014", "015", "016", "017", "018", "019", "020", "021"), 
+                       smoothing=TRUE, ncores = 36)
+  
+  dmls_004_against_all = callDML(dmltest_004_against_all, p.threshold = pval_t)
+  
+  dmls_004_against_all %>% 
+    as_tibble() %>% 
+    dplyr::mutate(start = pos) %>%
+    ggplot(aes(x = pos, y = -log10(pval), color = -log10(pval))) + 
+    geom_point(alpha = .8) +
+    theme_pubclean() -> dml_plot
+  
+  return(dml_plot)
+}
+
+make_gene_plot <- function (gff_df, genes, arrangement, arrangement_coordinates, padding) {
+  
+  arrangement_coordinates |> filter(name == arrangement) |> pull(chr) -> chr_rearrangement
+  arrangement_coordinates |> filter(name == arrangement) |> pull(start) -> start_rearrangement
+  arrangement_coordinates |> filter(name == arrangement) |> pull(end) -> end_rearrangement
+  
+  gff_df %>%
+    dplyr::mutate(chr = gsub("chr", "", chr)) |>
+    dplyr::filter(chr == chr_rearrangement) |>
+    dplyr::filter(between(start, start_rearrangement - padding, end_rearrangement + padding)) |>
+    dplyr::mutate(
+      molecule = ifelse(V7 == "+", 1,2), 
+      gene = name, 
+      start = start, 
+      end = V5, 
+      strand = ifelse(V7 == "+", "forward", "reverse"), 
+      orientation = ifelse(V7 == "-", 0, 1)
+    ) %>%
+    dplyr::filter(gene %in% genes) |>
+    dplyr::select(gene, start, end, strand, orientation, molecule) %>% 
+    ggplot(aes(xmin = start, xmax = end, y = molecule, fill = gene, label = gene, forward = orientation)) +
+    geom_gene_arrow() +
+    geom_gene_label(aes(label = gene)) +
+    theme_genes() +
+    theme(legend.position = "none")  + 
+    scale_x_continuous(labels = scales::comma, limits = c(start_rearrangement - padding, end_rearrangement + padding)) + 
+    theme_void() + 
+      ylab("") + 
+      theme(axis.title.y=element_blank(),
+            axis.text.y=element_blank(),
+            axis.ticks.y=element_blank()) + 
+      theme(axis.title.x=element_blank(),
+            axis.text.x=element_blank(),
+            axis.ticks.x=element_blank(),
+            legend.position = "none") + 
+      ylim(1-1,2+1) -> gene_plot
+  
+  return(gene_plot)
+}
+
+###############
+# Read modkit #
+###############
+
+read_modkit_files <- function(path_to_files, name_pattern) {
+  
+  modkit_files = dir(path_to_files, pattern = name_pattern, recursive = TRUE)
+  
+  methylation <-tibble(file = modkit_files) %>%
+    tidytable::mutate(file_contents = map(file, 
+                                                     ~ read_tsv(paste0(path_to_files, .), col_names = c("chr", "start", "end", "base", "X5", "X6", "X7", "X8", "X9", "X10", "X11", "X12", "X13", "X14", "X15", "X16", "X17", "X18"))),
+    ) %>%
+    unnest(file_contents) %>%
+    dplyr::mutate(sample = sub(".*op_\\d{3}_(\\d{3}).*", "\\1", file))
+  
+  return(methylation)
+}
+
+methylation <- read_modkit_files("/media/ssd_4tb/felix/projects/crebbp_methylation/promethion_methylation/review_comments/modkit_pileup/", "*regions.padded.merged.bed$")
+regions <- read_tsv("/media/ssd_4tb/felix/projects/crebbp_methylation/promethion_methylation/review_comments/regions.padded.merged.named.bed", col_names = c("chr", "start", "end", "name"))
+regions_breakpoints <- read_tsv("/media/ssd_4tb/felix/projects/crebbp_methylation/promethion_methylation/review_comments/regions.named.bed", col_names = c("chr", "start", "end", "name"))
+
+regions_breakpoints |>
+  group_by(name) |>
+  mutate(chr, start = min(start), end = max(end)) |>
+  distinct() -> arrangement_min_max
+
+make_meth_plot <- function(methylation_df, highlight_lines, n_cgs, arrangement, arrangement_coordinates, padding) {
+  
+  arrangement_coordinates |> filter(name == arrangement) |> pull(chr) -> chr_rearrangement
+  arrangement_coordinates |> filter(name == arrangement) |> pull(start) -> start_rearrangement
+  arrangement_coordinates |> filter(name == arrangement) |> pull(end) -> end_rearrangement
+  
+  methylation_df %>%
+    dplyr::filter(chr == chr_rearrangement) |>
+    dplyr::filter(between(start, start_rearrangement - padding, end_rearrangement + padding)) %>%
+    dplyr::group_by(sample) %>%
+    dplyr::arrange(start) %>%
+    dplyr::mutate(meth = data.table::frollmean(X11, n_cgs, align = "center")) -> plot_data 
+  
+  plot_data %>% 
+    ggplot(aes(start, meth, group = sample, color = sample)) +
+    geom_vline(xintercept = start_rearrangement, linetype = 2, alpha = .5) + 
+    geom_vline(xintercept = end_rearrangement, linetype = 2, alpha = .5) + 
+    geom_line(alpha = .3, linewidth = 0.2) +
+    theme_pubclean() + 
+    ylab("Methylation") +
+    xlab(paste0("Position chr", chr_rearrangement)) +
+    scale_y_continuous(labels = scales::percent_format(scale = 1), limits = c(0,100)) +
+    ggtitle(arrangement) +
+    theme(legend.position = "none") -> plot
+  if((end_rearrangement-start_rearrangement) > 2*10^6) {
+    plot <- plot + scale_x_continuous(labels = scales::comma_format(scale = 1/1000000, suffix = " Mb"), limits = c(start_rearrangement - padding, end_rearrangement + padding))
+  } else {
+    plot <- plot + scale_x_continuous(labels = scales::comma_format(scale = 1/1000, suffix = " kb"), limits = c(start_rearrangement - padding, end_rearrangement + padding)) 
+  }
+  
+  # Add geom_line for each highlighted sample
+  for (highlight_line in highlight_lines) {
+    plot <- plot + geom_line(data = plot_data[plot_data$sample == highlight_line, ], linewidth = .6, alpha = 1)
+  }
+  
+  return(plot)
+  
+}
+
+gff |> 
+  dplyr::filter(name %in% c("CREBBP", "IL1RAPL1", "ANK2", "CHD8")) |>
+  dplyr::mutate(chr = gsub("chr", "", chr), 
+         end = V5,
+         start = ifelse(V7 == "+", start, end),
+         end = ifelse(V7 == "+", start, end)) |>
+  dplyr::select(chr, start, end, name) -> gene_start_region
+```
+
+```{r}
+#########################
+# Supplementary figures #
+#########################
+
+plot_grid(ncol = 2, align = "h", axis = "left", labels = c("A", "", "", "", "B", "", "", ""), scale = 0.95,
+                             methylation |> 
+                               make_meth_plot(c("005", "009"), 500, "ANK2", arrangement_min_max, 10^6) + coord_cartesian(clip = "off"),
+                             methylation |> 
+                               make_meth_plot(c("019"), 500, "IL1RAPL1", arrangement_min_max, 10^6) + coord_cartesian(clip = "off"),
+                             methylation |> 
+                               make_meth_plot(c("014"), 150, "CHD8", arrangement_min_max, 10^5) + coord_cartesian(clip = "off"),
+                             methylation |> 
+                               make_meth_plot(c("004", "002"), 150, "CREBBP", arrangement_min_max, 10^5) + coord_cartesian(clip = "off")
+)
+
+plot_grid(ncol = 2, align = "h", axis = "left", labels = c("B"),
+                             methylation |> 
+                               make_meth_plot(c("005", "009"), 50, "ANK2", gene_start_region, 50000) + coord_cartesian(clip = "off"),
+                             methylation |> 
+                               make_meth_plot(c("019"), 50, "IL1RAPL1", gene_start_region, 50000) + coord_cartesian(clip = "off"),
+                             methylation |> 
+                               make_meth_plot(c("014"), 50, "CHD8", gene_start_region, 50000) + coord_cartesian(clip = "off"),
+                             methylation |> 
+                               make_meth_plot(c("004", "002"), 50, "CREBBP", gene_start_region, 50000)
+)
+
+
+###############
+# Main figure #
+###############
+
+CREBBP <- function(df) {
+  df %>%
+    filter(chr == "chr16" | chr == "16") %>%
+    filter(between(start, 3.*10^6, 4.2*10^6)) %>%
+    arrange(start) -> df_filtered
+  return(df_filtered)
+}
+
+saved_dmr_plot <- make_dmr_plot(CREBBP, c("004"), c("002"), 0.01) 
+
+plot_grid(ncol = 1, align = "v", axis = "left", rel_heights = c(6/13, 1/13, 6/13), labels = c('B', '', 'C'),
+  methylation |> 
+    make_meth_plot(c("004", "002"), 150, "CREBBP", arrangement_min_max, 5*10^4) + ggtitle("") + xlab("")
+  , gff |> 
+    make_gene_plot(c("DNASE1", "TRAP1", "CREBBP"), "CREBBP", arrangement_min_max, 5*10^4) 
+  , saved_dmr_plot + 
+    scale_x_continuous(labels = scales::comma, 
+                       limits = c(
+                         arrangement_min_max$start[which(arrangement_min_max$name=="CREBBP")]-5*10^4,
+                         arrangement_min_max$end[which(arrangement_min_max$name=="CREBBP")]+5*10^4)
+                       ) + 
+    ylim(0,45) +
+    ylab(expression(-log[10](p))) +
+    xlab("") + theme(legend.position = "none")
+)
+
+```
+
+```{r}
+sessionInfo()
+```
+
